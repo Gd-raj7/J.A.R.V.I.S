@@ -22,9 +22,3 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
-<<<<<<< HEAD
-.env
-.env.*
-!.env.example
-=======
->>>>>>> 1ee6359 (first commit)

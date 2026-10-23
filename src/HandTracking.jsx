@@ -17,8 +17,38 @@ function distance(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
-function Hologram({ gestureRef }) {
+function Hologram({ gestureRef, pausedRef, zoomRef, sensitivityRef }) {
   const mountRef = useRef(null);
+  const pointerRef = useRef({ down: false, x: 0, y: 0 });
+  const dragDeltaRef = useRef({ x: 0, y: 0 });
+
+  function handlePointerDown(event) {
+    pointerRef.current = { down: true, x: event.clientX, y: event.clientY };
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  }
+
+  function handlePointerMove(event) {
+    if (!pointerRef.current.down) return;
+    const dx = event.clientX - pointerRef.current.x;
+    const dy = event.clientY - pointerRef.current.y;
+    dragDeltaRef.current.x += dx;
+    dragDeltaRef.current.y += dy;
+    pointerRef.current.x = event.clientX;
+    pointerRef.current.y = event.clientY;
+  }
+
+  function handlePointerUp() {
+    pointerRef.current.down = false;
+  }
+
+  function handleWheel(event) {
+    event.preventDefault();
+    zoomRef.current = THREE.MathUtils.clamp(
+      zoomRef.current * (event.deltaY > 0 ? 0.92 : 1.08),
+      0.65,
+      2.2
+    );
+  }
 
   useEffect(() => {
     const host = mountRef.current;
@@ -39,7 +69,7 @@ function Hologram({ gestureRef }) {
       antialias: true,
       alpha: false,
     });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
     renderer.setSize(host.clientWidth, host.clientHeight);
     host.appendChild(renderer.domElement);
 
@@ -131,27 +161,36 @@ function Hologram({ gestureRef }) {
       frame = requestAnimationFrame(animate);
 
       const gesture = gestureRef.current;
+      const paused = pausedRef.current;
 
-      if (gesture?.pinching && gesture.index) {
+      // Mouse/touch dragging works independently from camera hand tracking.
+      const drag = dragDeltaRef.current;
+      if (Math.abs(drag.x) > 0.01 || Math.abs(drag.y) > 0.01) {
+        group.rotation.y += drag.x * 0.008;
+        group.rotation.x += drag.y * 0.008;
+        drag.x = 0;
+        drag.y = 0;
+      }
+
+      if (!paused && !gesture?.standby && gesture?.pinching && gesture.index) {
         if (lastX !== null) {
-          group.rotation.y += (gesture.index.x - lastX) * 5;
-          group.rotation.x += (gesture.index.y - lastY) * 5;
+          const dx = gesture.index.x - lastX;
+          const dy = gesture.index.y - lastY;
+          group.rotation.y += dx * sensitivityRef.current;
+          group.rotation.x += dy * sensitivityRef.current;
         }
         lastX = gesture.index.x;
         lastY = gesture.index.y;
       } else {
         lastX = null;
         lastY = null;
-        group.rotation.y += 0.002;
-        group.rotation.x += 0.0005;
+        if (!paused && !gesture?.standby) group.rotation.y += 0.00035;
       }
 
-      const targetScale = gesture?.scale ?? 1;
-      const smoothScale = THREE.MathUtils.clamp(targetScale, 0.65, 1.8);
-      group.scale.lerp(
-        new THREE.Vector3(smoothScale, smoothScale, smoothScale),
-        0.12
-      );
+      const handScale = gesture?.scale ?? 1;
+      const targetScale = THREE.MathUtils.clamp(handScale * zoomRef.current, 0.65, 2.2);
+      const smoothScale = THREE.MathUtils.damp(group.scale.x, targetScale, 5, 1 / 60);
+      group.scale.setScalar(smoothScale);
 
       stars.rotation.y += 0.00015;
       renderer.render(scene, camera);
@@ -177,7 +216,18 @@ function Hologram({ gestureRef }) {
     };
   }, [gestureRef]);
 
-  return <div className="hologram-canvas" ref={mountRef} />;
+  return (
+    <div
+      className="hologram-canvas touch-spatial-surface"
+      ref={mountRef}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerUp}
+      onWheel={handleWheel}
+      title="Drag to rotate · Scroll or pinch to zoom"
+    />
+  );
 }
 
 export default function HandTracking() {
@@ -185,11 +235,11 @@ export default function HandTracking() {
   const overlayRef = useRef(null);
   const trackerRef = useRef(null);
   const streamRef = useRef(null);
-  const gestureRef = useRef({
-    pinching: false,
-    index: null,
-    scale: 1,
-  });
+  const gestureRef = useRef({ pinching: false, index: null, scale: 1 });
+  const pausedRef = useRef(false);
+  const zoomRef = useRef(1);
+  const sensitivityRef = useRef(3.0);
+  const calibrationRef = useRef({ pinch: true, scale: true, standby: true, pinchThreshold: 0.045, baseline: null });
 
   const [status, setStatus] = useState("STARTING");
   const [hands, setHands] = useState(0);
@@ -207,6 +257,62 @@ export default function HandTracking() {
   const [listening, setListening] = useState(false);
   const [error, setError] = useState("");
   const [provider, setProvider] = useState("auto");
+  const [paused, setPaused] = useState(false);
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [zoom, setZoom] = useState(1);
+  const [sensitivity, setSensitivity] = useState(3.0);
+  const [calibrationOpen, setCalibrationOpen] = useState(false);
+  const [pinchThreshold, setPinchThreshold] = useState(0.045);
+  const [gestureEnabled, setGestureEnabled] = useState({ pinch: true, scale: true, standby: true });
+  const [baselineReady, setBaselineReady] = useState(false);
+  const [calibrationMessage, setCalibrationMessage] = useState("Show your relaxed hand, then capture baseline.");
+
+  function updateGestureEnabled(key, checked) {
+    setGestureEnabled((current) => {
+      const next = { ...current, [key]: checked };
+      calibrationRef.current = { ...calibrationRef.current, ...next };
+      return next;
+    });
+  }
+
+  function captureNeutralBaseline() {
+    const hand = gestureRef.current?.landmarks;
+    if (!hand) {
+      setCalibrationMessage("No hand detected yet. Place one hand in view and try again.");
+      return;
+    }
+    const palmWidth = distance(hand[5], hand[17]);
+    if (!Number.isFinite(palmWidth) || palmWidth < 0.01) {
+      setCalibrationMessage("Keep your palm facing the camera and try again.");
+      return;
+    }
+    calibrationRef.current.baseline = palmWidth;
+    setBaselineReady(true);
+    setCalibrationMessage("Neutral baseline captured. Keep a similar distance from the camera.");
+  }
+
+  function changeZoom(amount) {
+    setZoom((current) => {
+      const next = THREE.MathUtils.clamp(current + amount, 0.65, 2.2);
+      zoomRef.current = next;
+      return next;
+    });
+  }
+
+  function togglePause() {
+    setPaused((current) => {
+      const next = !current;
+      pausedRef.current = next;
+      return next;
+    });
+  }
+
+  function resetView() {
+    zoomRef.current = 1;
+    setZoom(1);
+    pausedRef.current = false;
+    setPaused(false);
+  }
 
   useEffect(() => {
     let active = true;
@@ -215,6 +321,11 @@ export default function HandTracking() {
     let lastUiUpdate = 0;
     let frameCount = 0;
     let fpsStart = performance.now();
+    let smoothedIndex = null;
+    let pinchLatched = false;
+    let standbyLatched = false;
+    let smoothedSpan = null;
+    const smoothing = 0.22;
 
     async function start() {
       let tracker;
@@ -226,8 +337,8 @@ export default function HandTracking() {
           audio: false,
           video: {
             facingMode: "user",
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
+            width: { ideal: 640 },
+            height: { ideal: 480 },
           },
         });
 
@@ -341,28 +452,58 @@ export default function HandTracking() {
           let pinching = false;
           let index = null;
           let scale = 1;
+          let standby = false;
           let label = landmarks.length
             ? `${landmarks.length} HAND${landmarks.length > 1 ? "S" : ""} TRACKED`
             : "SHOW YOUR HANDS";
 
           if (first) {
-            const pinchDistance = distance(first[4], first[8]);
-            pinching = pinchDistance < 0.055;
-            index = {
-              x: 1 - first[8].x,
-              y: first[8].y,
-            };
+            const calibration = calibrationRef.current;
+            const palmWidth = Math.max(distance(first[5], first[17]), 0.001);
+            const normalizedPinchDistance = distance(first[4], first[8]) / (calibration.baseline ?? palmWidth);
+            const threshold = calibration.pinchThreshold;
+            // Palm-open detection: four fingertips extended beyond their middle joints.
+            const extended = [[8, 6], [12, 10], [16, 14], [20, 18]]
+              .filter(([tip, joint]) => first[tip].y < first[joint].y).length;
+            const palmOpen = extended >= 4 && normalizedPinchDistance > 0.32;
+            if (calibration.standby && palmOpen) standbyLatched = true;
+            // Close the palm or make a clear pinch to resume control.
+            const fistClosed = extended <= 1;
+            const clearPinch = normalizedPinchDistance < threshold * 0.8;
+            if (fistClosed || clearPinch) standbyLatched = false;
+            standby = calibration.standby && standbyLatched;
 
-            label = pinching ? "PINCH · ROTATE HOLOGRAM" : label;
+            // Hysteresis avoids flickering around the user-adjustable threshold.
+            if (!pinchLatched && normalizedPinchDistance < threshold) pinchLatched = true;
+            if (pinchLatched && normalizedPinchDistance > threshold * 1.35) pinchLatched = false;
+            pinching = calibration.pinch && pinchLatched && !standby;
+
+            const rawIndex = { x: 1 - first[8].x, y: first[8].y };
+            if (!smoothedIndex) smoothedIndex = rawIndex;
+            else {
+              smoothedIndex.x += (rawIndex.x - smoothedIndex.x) * smoothing;
+              smoothedIndex.y += (rawIndex.y - smoothedIndex.y) * smoothing;
+            }
+            index = { ...smoothedIndex };
+            label = standby ? "OPEN PALM · STANDBY" : pinching ? "PINCH · ROTATE HOLOGRAM" : label;
+          } else {
+            smoothedIndex = null;
+            pinchLatched = false;
+            standbyLatched = false;
           }
 
-          if (first && second) {
-            const span = distance(first[8], second[8]);
-            scale = THREE.MathUtils.clamp(0.7 + span * 2.8, 0.7, 1.8);
-            label = "TWO HANDS · SCALE HOLOGRAM";
+          if (first && second && calibrationRef.current.scale) {
+            const rawSpan = distance(first[8], second[8]);
+            smoothedSpan = smoothedSpan == null
+              ? rawSpan
+              : smoothedSpan + (rawSpan - smoothedSpan) * 0.18;
+            scale = THREE.MathUtils.clamp(0.7 + smoothedSpan * 2.8, 0.7, 1.8);
+            label = standby ? "OPEN PALM · STANDBY" : "TWO HANDS · SCALE HOLOGRAM";
+          } else {
+            smoothedSpan = null;
           }
 
-          gestureRef.current = { pinching, index, scale };
+          gestureRef.current = { pinching, index, scale, standby, landmarks: first ?? null };
 
           if (now - lastUiUpdate > 100) {
             setHands(landmarks.length);
@@ -543,10 +684,82 @@ export default function HandTracking() {
             </div>
             <span className="pill">3D ACTIVE</span>
           </div>
-          <Hologram gestureRef={gestureRef} />
+          <Hologram
+            gestureRef={gestureRef}
+            pausedRef={pausedRef}
+            zoomRef={zoomRef}
+            sensitivityRef={sensitivityRef}
+          />
+          <div className="spatial-controls">
+            <button type="button" onClick={() => changeZoom(0.15)}>+ Zoom</button>
+            <button type="button" onClick={() => changeZoom(-0.15)}>− Zoom</button>
+            <button type="button" onClick={togglePause}>{paused ? "Resume" : "Pause"}</button>
+            <button type="button" onClick={resetView}>Reset view</button>
+            <button type="button" onClick={() => setDetailsOpen((value) => !value)}>
+              {detailsOpen ? "Hide details" : "Details"}
+            </button>
+            <label className="sensitivity-control">
+              Hand sensitivity
+              <input
+                type="range"
+                min="1"
+                max="6"
+                step="0.5"
+                value={sensitivity}
+                onChange={(event) => {
+                  const value = Number(event.target.value);
+                  setSensitivity(value);
+                  sensitivityRef.current = value;
+                }}
+                aria-label="Hand rotation sensitivity"
+              />
+              <span>{sensitivity.toFixed(1)}×</span>
+            </label>
+          </div>
+          <div className="calibration-heading">
+            <button type="button" onClick={() => setCalibrationOpen((open) => !open)}>
+              {calibrationOpen ? "Close calibration" : "⚙ Calibration mode"}
+            </button>
+            <span className={`calibration-status ${baselineReady ? "ready" : ""}`}>
+              {baselineReady ? "BASELINE SET" : "BASELINE NOT SET"}
+            </span>
+          </div>
+          {calibrationOpen && (
+            <div className="calibration-panel">
+              <div className="calibration-topline">
+                <div>
+                  <strong>Gesture calibration</strong>
+                  <p className="hint">Capture your relaxed hand position, then tune each gesture.</p>
+                </div>
+                <button type="button" onClick={captureNeutralBaseline}>Capture neutral baseline</button>
+              </div>
+              <label className="calibration-range">
+                Pinch threshold <strong>{pinchThreshold.toFixed(3)}</strong>
+                <input type="range" min="0.025" max="0.09" step="0.005" value={pinchThreshold}
+                  onChange={(event) => {
+                    const value = Number(event.target.value);
+                    setPinchThreshold(value);
+                    calibrationRef.current.pinchThreshold = value;
+                  }} aria-label="Pinch detection threshold" />
+                <small>Lower = tighter pinch required; higher = easier to trigger.</small>
+              </label>
+              <div className="gesture-toggles">
+                <label><input type="checkbox" checked={gestureEnabled.pinch} onChange={(event) => updateGestureEnabled("pinch", event.target.checked)} /> Pinch to rotate</label>
+                <label><input type="checkbox" checked={gestureEnabled.scale} onChange={(event) => updateGestureEnabled("scale", event.target.checked)} /> Two hands to scale</label>
+                <label><input type="checkbox" checked={gestureEnabled.standby} onChange={(event) => updateGestureEnabled("standby", event.target.checked)} /> Open palm standby</label>
+              </div>
+              <p className="hint calibration-message">{calibrationMessage}</p>
+            </div>
+          )}
+          {detailsOpen && (
+            <p className="hint spatial-hint">
+              Pinch and move to rotate. Spread both hands to scale. Drag the hologram with your mouse or finger; scroll to zoom. Show one open palm to enter standby, then close your hand or pinch to resume. Smoothing and pinch hysteresis reduce jitter.
+            </p>
+          )}
           <div className="holo-legend">
-            <span><i /> ROTATION: PINCH + MOVE</span>
-            <span><i /> SCALE: TWO HANDS</span>
+            <span><i /> ROTATE: PINCH / TOUCH-DRAG</span>
+            <span><i /> SCALE: TWO HANDS / SCROLL</span>
+            <span><i /> OPEN PALM: STANDBY</span>
           </div>
         </section>
 
